@@ -3,7 +3,7 @@
   "publisher": "LiaoJianjin",
   "displayName": "Remote Model Viewer",
   "description": "View machine learning model files with Netron directly on the local or Remote SSH host without copying weights to local disk.",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "icon": "media/extension-icon.png",
   "license": "MIT",
   "repository": {
