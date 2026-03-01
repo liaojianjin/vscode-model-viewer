@@ -2,11 +2,14 @@
 
 一个最小可运行的 VS Code 扩展，用来在本地或 Remote SSH 宿主机上直接启动 Netron，并在 VS Code 内嵌显示它的原生 UI。
 
+同时也提供一个独立的 `Safetensors Explorer`，用于在不传完整权重文件的前提下，直接查看远端 safetensors 的 tensor 列表，并在点击时懒加载 tensor 值。
+
 核心目标：
 
 - 不把权重文件先下载到本地磁盘再打开
 - 在 Remote SSH 场景里直接读取远端模型文件
 - UI 直接复用 Netron 服务页面，因此交互和视觉基本就是 Netron 本身
+- 对 `.safetensors` / `.safetensors.index.json` 提供专门的远端懒加载查看器
 
 ## 工作方式
 
@@ -39,6 +42,16 @@ pip install netron
 - 或者打开文件后，在编辑器标题栏执行 `Open Active File in Remote Model Viewer`
 - 也可以从命令面板运行这两个命令
 
+如果你打开的是 safetensors：
+
+- 在资源管理器里右键 `.safetensors` 或 `.safetensors.index.json`
+- 选择 `Open in Safetensors Explorer`
+- 左侧会按 tensor name 前缀分层展开，并显示完整 tensor 名称、shape、dtype
+- 可以用搜索框过滤，也可以勾选 `Prefix only` 做前缀过滤
+- 右侧选中 tensor 后，先点击 `Load Tensor Values`，再用 `Load More` 分页继续加载
+
+这个流程只会先读取 header 或 `model.safetensors.index.json` + 各 shard header；`index.json` 会继续定位到对应 `.safetensors` 分片并合并出完整 tensor 列表。具体 tensor 值会在点击时才从远端文件按区间读取。
+
 ## 支持说明
 
 模型格式由 Netron 自己决定，常见如：
@@ -52,6 +65,7 @@ pip install netron
 - `.h5`
 - `.keras`
 - `.safetensors`
+- `.safetensors.index.json`
 
 这个扩展本身不做格式白名单限制，只要 Netron 能识别，它就能尝试打开。
 
@@ -83,7 +97,7 @@ npm run package
 执行后会在当前目录生成一个 `.vsix` 文件，默认文件名类似：
 
 ```text
-remote-model-viewer-0.0.2.vsix
+remote-model-viewer-0.0.5.vsix
 ```
 
 你可以直接把这个 `.vsix` 发给别人安装，或者自己在 VS Code 里用 “Extensions: Install from VSIX...” 安装。
@@ -93,6 +107,8 @@ remote-model-viewer-0.0.2.vsix
 - 当前版本依赖远端已安装 `netron` Python 包，不会自动安装
 - webview 里展示的是 Netron 原生页面，因此扩展层只负责“拉起服务 + 嵌入展示”，不拦截 Netron 内部行为
 - “不下载权重”指不额外把模型文件复制到本地磁盘；浏览器/VS Code 与 Netron 服务之间仍然会按页面需要传输可视化数据
+- `Safetensors Explorer` 当前只对 tensor 值做按需读取，预览格式优先支持常见 dtype（如 `F16`、`BF16`、`F32`、`F64`、整数和 `BOOL`）
+- `Safetensors Explorer` 当前采用分页预览，不会一次性把超大 tensor 整体搬到前端
 
 ## 参考
 

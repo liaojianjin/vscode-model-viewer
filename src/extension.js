@@ -5,6 +5,7 @@ const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { registerSafetensorsExplorer } = require('./safetensorsExplorer');
 
 const activeSessions = new Set();
 
@@ -20,6 +21,7 @@ function activate(context) {
       const activeUri = vscode.window.activeTextEditor?.document?.uri;
       await openModelPanel(context, output, activeUri);
     }),
+    registerSafetensorsExplorer(output),
     {
       dispose: () => {
         for (const session of Array.from(activeSessions)) {

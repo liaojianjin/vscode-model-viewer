@@ -3,7 +3,8 @@
   "publisher": "LiaoJianjin",
   "displayName": "Remote Model Viewer",
   "description": "View machine learning model files with Netron directly on the local or Remote SSH host without copying weights to local disk.",
-  "version": "0.0.2",
+  "version": "0.0.5",
+  "icon": "media/extension-icon.png",
   "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
@@ -23,7 +24,8 @@
   "main": "./src/extension.js",
   "activationEvents": [
     "onCommand:remoteModelViewer.openModel",
-    "onCommand:remoteModelViewer.openActiveModel"
+    "onCommand:remoteModelViewer.openActiveModel",
+    "onCommand:remoteModelViewer.openSafetensorsExplorer"
   ],
   "extensionKind": [
     "workspace",
@@ -42,6 +44,12 @@
         "title": "Open Active File in Remote Model Viewer",
         "category": "Remote Model Viewer",
         "icon": "$(preview)"
+      },
+      {
+        "command": "remoteModelViewer.openSafetensorsExplorer",
+        "title": "Open in Safetensors Explorer",
+        "category": "Remote Model Viewer",
+        "icon": "$(symbol-array)"
       }
     ],
     "menus": {
@@ -50,18 +58,44 @@
           "command": "remoteModelViewer.openModel",
           "when": "explorerResourceIsFolder == false",
           "group": "navigation"
+        },
+        {
+          "command": "remoteModelViewer.openSafetensorsExplorer",
+          "when": "explorerResourceIsFolder == false && resourceFilename =~ /.*\\.safetensors(\\.index\\.json)?$/",
+          "group": "navigation@1"
         }
       ],
       "editor/title": [
         {
           "command": "remoteModelViewer.openActiveModel",
           "group": "navigation"
+        },
+        {
+          "command": "remoteModelViewer.openSafetensorsExplorer",
+          "when": "resourceFilename =~ /.*\\.safetensors(\\.index\\.json)?$/",
+          "group": "navigation@1"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "remoteModelViewer.openModel",
+          "group": "3_preview"
+        },
+        {
+          "command": "remoteModelViewer.openSafetensorsExplorer",
+          "when": "resourceFilename =~ /.*\\.safetensors(\\.index\\.json)?$/",
+          "group": "3_preview@1"
         }
       ],
       "editor/context": [
         {
           "command": "remoteModelViewer.openActiveModel",
           "group": "navigation"
+        },
+        {
+          "command": "remoteModelViewer.openSafetensorsExplorer",
+          "when": "resourceFilename =~ /.*\\.safetensors(\\.index\\.json)?$/",
+          "group": "navigation@1"
         }
       ]
     },
@@ -88,7 +122,7 @@
     }
   },
   "scripts": {
-    "check:js": "node --check src/extension.js",
+    "check:js": "node --check src/extension.js && node --check src/safetensorsExplorer.js",
     "check:py": "python3 -m py_compile scripts/netron_server.py",
     "check": "npm run check:js && npm run check:py",
     "package": "npm run check && npx @vscode/vsce package --no-dependencies"
