@@ -1,0 +1,99 @@
+{
+  "name": "remote-model-viewer",
+  "publisher": "LiaoJianjin",
+  "displayName": "Remote Model Viewer",
+  "description": "View machine learning model files with Netron directly on the local or Remote SSH host without copying weights to local disk.",
+  "version": "0.0.2",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "netron",
+    "onnx",
+    "pytorch",
+    "tensorflow",
+    "remote-ssh",
+    "model"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onCommand:remoteModelViewer.openModel",
+    "onCommand:remoteModelViewer.openActiveModel"
+  ],
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "remoteModelViewer.openModel",
+        "title": "Open in Remote Model Viewer",
+        "category": "Remote Model Viewer",
+        "icon": "$(preview)"
+      },
+      {
+        "command": "remoteModelViewer.openActiveModel",
+        "title": "Open Active File in Remote Model Viewer",
+        "category": "Remote Model Viewer",
+        "icon": "$(preview)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "remoteModelViewer.openModel",
+          "when": "explorerResourceIsFolder == false",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "remoteModelViewer.openActiveModel",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "remoteModelViewer.openActiveModel",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Remote Model Viewer",
+      "properties": {
+        "remoteModelViewer.pythonCommand": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python command used to launch the Netron bridge process on the extension host."
+        },
+        "remoteModelViewer.startupTimeoutMs": {
+          "type": "number",
+          "default": 15000,
+          "minimum": 1000,
+          "description": "How long to wait for the Netron HTTP server to become reachable."
+        },
+        "remoteModelViewer.enableVerboseServerLog": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable verbose logging when calling netron.start(...)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check:js": "node --check src/extension.js",
+    "check:py": "python3 -m py_compile scripts/netron_server.py",
+    "check": "npm run check:js && npm run check:py",
+    "package": "npm run check && npx @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "latest"
+  }
+}

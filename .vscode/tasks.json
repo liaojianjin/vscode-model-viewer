@@ -1,0 +1,13 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "npm: check",
+      "type": "npm",
+      "script": "check",
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Validate extension entrypoints before launching the extension host."
+    }
+  ]
+}
