@@ -161,7 +161,7 @@ npm run package
    选择生成的 `.vsix` 文件，例如：
 
 ```text
-remote-model-viewer-0.0.6.vsix
+remote-model-viewer-0.0.7.vsix
 ```
 
 ## Development / 开发

@@ -1068,6 +1068,7 @@ function getSafetensorsExplorerHtml(webview, fileName) {
   </div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
+    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
     const state = {
       manifest: null,
       selectedName: null,
@@ -1120,6 +1121,29 @@ function getSafetensorsExplorerHtml(webview, fileName) {
     function splitTensorName(name) {
       const parts = String(name).split('.').filter(Boolean);
       return parts.length === 0 ? [String(name)] : parts;
+    }
+
+    function compareTreeSegment(leftSegment, rightSegment) {
+      return collator.compare(String(leftSegment), String(rightSegment));
+    }
+
+    function compareTreeNames(leftName, rightName) {
+      const leftParts = splitTensorName(leftName);
+      const rightParts = splitTensorName(rightName);
+      const length = Math.max(leftParts.length, rightParts.length);
+      for (let index = 0; index < length; index += 1) {
+        if (index >= leftParts.length) {
+          return -1;
+        }
+        if (index >= rightParts.length) {
+          return 1;
+        }
+        const difference = compareTreeSegment(leftParts[index], rightParts[index]);
+        if (difference !== 0) {
+          return difference;
+        }
+      }
+      return 0;
     }
 
     function normalizeText(value) {
@@ -1317,8 +1341,9 @@ function getSafetensorsExplorerHtml(webview, fileName) {
       body.className = 'tree-body';
 
       const fragment = document.createDocumentFragment();
-      const tree = buildTree(visibleTensors);
-      const entries = Array.from(tree.values()).sort((left, right) => left.label.localeCompare(right.label));
+      const sortedVisibleTensors = visibleTensors.slice().sort((left, right) => compareTreeNames(left.name, right.name));
+      const tree = buildTree(sortedVisibleTensors);
+      const entries = Array.from(tree.values());
       for (const entry of entries) {
         fragment.appendChild(renderTreeNode(entry, 0));
       }
@@ -1437,7 +1462,7 @@ function getSafetensorsExplorerHtml(webview, fileName) {
         }
       });
 
-      const children = Array.from(node.children.values()).sort((left, right) => left.label.localeCompare(right.label));
+      const children = Array.from(node.children.values());
       for (const child of children) {
         container.appendChild(renderTreeNode(child, depth + 1));
       }
