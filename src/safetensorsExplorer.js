@@ -186,7 +186,8 @@ class SafetensorsRepository {
   }
 
   async getManifestPayload() {
-    const tensors = (await this.getAllRecords()).map((record) => toTensorSummary(record));
+    const records = await this.getAllRecords();
+    const tensors = records.map((record) => toTensorSummary(record, records));
 
     return {
       title: path.basename(this.rootPath),
@@ -201,18 +202,36 @@ class SafetensorsRepository {
 
   async getTensorDetails(name) {
     const record = await this.getRecord(name);
+    const records = await this.getAllRecords();
     return {
-      tensor: toTensorSummary(record)
+      tensor: toTensorSummary(record, records)
     };
   }
 
   async getTensorPreview(name, options = {}) {
     const record = await this.getRecord(name);
     const preview = await readTensorPreview(record, options);
+    preview.dequantized = await this.getDequantizedPreview(record, preview, options);
     return {
       name: record.name,
       preview
     };
+  }
+
+  async getDequantizedPreview(record, preview, options = {}) {
+    if (!preview || !preview.supported || !Array.isArray(preview.values) || preview.values.length === 0) {
+      return null;
+    }
+
+    const records = await this.getAllRecords();
+    const plan = buildDequantizationPlan(record, records);
+    if (!plan) {
+      return null;
+    }
+    if (!plan.supported) {
+      return plan;
+    }
+    return await applyDequantizationPreview(record, preview, plan, options);
   }
 
   async getRecord(name) {
@@ -357,8 +376,8 @@ async function readTensorPreview(record, options = {}) {
   const limit = Number.isFinite(options.limit) ? Math.max(1, Math.trunc(options.limit)) : PREVIEW_PAGE_ELEMENT_LIMIT;
   const totalElements = record.elementCount;
   const totalElementNumber = totalElements !== null && totalElements <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(totalElements) : null;
-  const bytesPerElement = decoder.bytesPerElement;
-  const maxElementsPerPage = Math.max(1, Math.floor(MAX_PREVIEW_BYTES / bytesPerElement));
+  const bitsPerElement = decoder.bitsPerElement;
+  const maxElementsPerPage = Math.max(1, Math.floor((MAX_PREVIEW_BYTES * 8) / bitsPerElement));
 
   if (totalElementNumber !== null && offset >= totalElementNumber) {
     return {
@@ -373,15 +392,19 @@ async function readTensorPreview(record, options = {}) {
     };
   }
 
-  const availableElementsFromBytes = Math.max(0, Math.floor(Math.max(0, record.byteLength - (offset * bytesPerElement)) / bytesPerElement));
+  const bitOffset = offset * bitsPerElement;
+  const byteOffset = Math.floor(bitOffset / 8);
+  const bitShift = bitOffset % 8;
+  const availableBitsFromBytes = Math.max(0, (record.byteLength * 8) - bitOffset);
+  const availableElementsFromBytes = Math.max(0, Math.floor(availableBitsFromBytes / bitsPerElement));
   const remainingElements = totalElementNumber === null ? availableElementsFromBytes : Math.max(0, totalElementNumber - offset);
   const requestedElements = Math.max(0, Math.min(remainingElements, availableElementsFromBytes, limit, maxElementsPerPage));
-  const byteLength = requestedElements * bytesPerElement;
-  const buffer = byteLength > 0 ? await readFileRange(record.filePath, record.dataOffset + (offset * bytesPerElement), byteLength) : Buffer.alloc(0);
-  const values = decodeValues(buffer, decoder);
+  const byteLength = requestedElements > 0 ? Math.ceil((bitShift + (requestedElements * bitsPerElement)) / 8) : 0;
+  const buffer = byteLength > 0 ? await readFileRange(record.filePath, record.dataOffset + byteOffset, byteLength) : Buffer.alloc(0);
+  const values = decodeValues(buffer, decoder, requestedElements, bitShift);
   const nextOffset = offset + values.length;
   const hasMore = totalElementNumber === null ?
-    (record.byteLength > nextOffset * bytesPerElement) :
+    ((record.byteLength * 8) > nextOffset * bitsPerElement) :
     (nextOffset < totalElementNumber);
 
   return {
@@ -407,32 +430,465 @@ async function readFileRange(filePath, offset, length) {
   }
 }
 
-function decodeValues(buffer, decoder) {
+function buildDequantizationPlan(record, records) {
+  const decoder = getDecoder(record.dtype);
+  const dtype = normalizeDtype(record.dtype);
+  const scaleMatch = findRelatedTensor(record.name, records, getScaleCandidateNames(record.name));
+  const zeroPointMatch = findRelatedTensor(record.name, records, getZeroPointCandidateNames(record.name));
+  const isDirectQuantizedValue = decoder && (decoder.quantized || dtype === 'I8' || dtype === 'U8');
+
+  if (!scaleMatch) {
+    if (!decoder || !decoder.quantized) {
+      return null;
+    }
+    return {
+      supported: false,
+      reason: 'No related scale tensor was found. The stored dtype values are shown instead.'
+    };
+  }
+
+  if (!isDirectQuantizedValue) {
+    return {
+      supported: false,
+      reason: `A related scale tensor was found, but dequantization for packed or non-direct dtype "${record.dtype}" is not implemented.`
+    };
+  }
+
+  if (!getDecoder(scaleMatch.record.dtype)) {
+    return {
+      supported: false,
+      reason: `Scale tensor "${scaleMatch.record.name}" uses unsupported dtype "${scaleMatch.record.dtype}".`
+    };
+  }
+
+  const scaleMapping = createAuxiliaryTensorMapping(record, scaleMatch.record);
+  if (!scaleMapping) {
+    return {
+      supported: false,
+      reason: `Scale tensor "${scaleMatch.record.name}" shape ${formatShape(scaleMatch.record.shape)} cannot be mapped to weight shape ${formatShape(record.shape)}.`
+    };
+  }
+
+  let zeroPoint = null;
+  if (zeroPointMatch) {
+    if (!getDecoder(zeroPointMatch.record.dtype)) {
+      return {
+        supported: false,
+        reason: `Zero-point tensor "${zeroPointMatch.record.name}" uses unsupported dtype "${zeroPointMatch.record.dtype}".`
+      };
+    }
+    const zeroPointMapping = createAuxiliaryTensorMapping(record, zeroPointMatch.record);
+    if (!zeroPointMapping) {
+      return {
+        supported: false,
+        reason: `Zero-point tensor "${zeroPointMatch.record.name}" shape ${formatShape(zeroPointMatch.record.shape)} cannot be mapped to weight shape ${formatShape(record.shape)}.`
+      };
+    }
+    zeroPoint = {
+      record: zeroPointMatch.record,
+      mapping: zeroPointMapping
+    };
+  }
+
+  const scaleOperation = scaleMatch.kind === 'inverse' ? 'divide' : 'multiply';
+  return {
+    supported: true,
+    scaleOperation,
+    scale: {
+      record: scaleMatch.record,
+      mapping: scaleMapping
+    },
+    zeroPoint
+  };
+}
+
+async function applyDequantizationPreview(record, preview, plan) {
+  const valueCache = new Map();
+  const startOffset = Number.isFinite(preview.offset) ? Math.max(0, Math.trunc(preview.offset)) : 0;
+  const values = [];
+
+  const readAuxiliaryValue = async (auxRecord, offset) => {
+    const key = `${auxRecord.name}:${offset}`;
+    if (!valueCache.has(key)) {
+      valueCache.set(key, readTensorPreview(auxRecord, { offset, limit: 1 }));
+    }
+    const auxPreview = await valueCache.get(key);
+    if (!auxPreview.supported || !Array.isArray(auxPreview.values) || auxPreview.values.length === 0) {
+      return null;
+    }
+    return toFiniteNumber(auxPreview.values[0]);
+  };
+
+  for (let index = 0; index < preview.values.length; index += 1) {
+    const tensorOffset = startOffset + index;
+    const storedValue = toFiniteNumber(preview.values[index]);
+    const scaleOffset = plan.scale.mapping.toAuxiliaryOffset(tensorOffset);
+    const scale = await readAuxiliaryValue(plan.scale.record, scaleOffset);
+
+    if (storedValue === null || scale === null || (plan.scaleOperation === 'divide' && scale === 0)) {
+      values.push(null);
+      continue;
+    }
+
+    let centeredValue = storedValue;
+    if (plan.zeroPoint) {
+      const zeroPointOffset = plan.zeroPoint.mapping.toAuxiliaryOffset(tensorOffset);
+      const zeroPoint = await readAuxiliaryValue(plan.zeroPoint.record, zeroPointOffset);
+      if (zeroPoint === null) {
+        values.push(null);
+        continue;
+      }
+      centeredValue -= zeroPoint;
+    }
+
+    values.push(plan.scaleOperation === 'divide' ? centeredValue / scale : centeredValue * scale);
+  }
+
+  const zeroPointText = plan.zeroPoint ? ` and zero point "${plan.zeroPoint.record.name}"` : '';
+  const operationText = plan.scaleOperation === 'divide' ? '(stored - zeroPoint) / scale_inv' : '(stored - zeroPoint) * scale';
+  return {
+    supported: true,
+    values,
+    method: `${operationText} using "${plan.scale.record.name}"${zeroPointText}`,
+    scaleTensor: plan.scale.record.name,
+    scaleMapping: plan.scale.mapping.description,
+    zeroPointTensor: plan.zeroPoint ? plan.zeroPoint.record.name : null
+  };
+}
+
+function findRelatedTensor(name, records, candidateNames) {
+  const byName = new Map(records.map((record) => [record.name, record]));
+  for (const candidate of candidateNames) {
+    if (byName.has(candidate.name)) {
+      return {
+        record: byName.get(candidate.name),
+        kind: candidate.kind
+      };
+    }
+  }
+  return null;
+}
+
+function getScaleCandidateNames(name) {
+  const candidates = [];
+  const add = (candidateName, kind = 'scale') => {
+    if (candidateName && candidateName !== name && !candidates.some((candidate) => candidate.name === candidateName)) {
+      candidates.push({ name: candidateName, kind });
+    }
+  };
+
+  add(`${name}_scale`);
+  add(`${name}_scales`);
+  add(`${name}.scale`);
+  add(`${name}.scales`);
+  add(`${name}_scale_inv`, 'inverse');
+  add(`${name}.scale_inv`, 'inverse');
+
+  for (const suffix of ['.weight', '_weight']) {
+    if (name.endsWith(suffix)) {
+      const base = name.slice(0, -suffix.length);
+      add(`${base}${suffix}_scale`);
+      add(`${base}${suffix}_scales`);
+      add(`${base}${suffix}.scale`);
+      add(`${base}${suffix}.scales`);
+      add(`${base}${suffix}_scale_inv`, 'inverse');
+      add(`${base}${suffix}.scale_inv`, 'inverse');
+      add(`${base}.scale`);
+      add(`${base}.scales`);
+      add(`${base}_scale`);
+      add(`${base}_scales`);
+      add(`${base}.weight_scale`);
+      add(`${base}.weight_scales`);
+      add(`${base}.weight_scale_inv`, 'inverse');
+      add(`${base}_weight_scale`);
+      add(`${base}_weight_scales`);
+      add(`${base}_weight_scale_inv`, 'inverse');
+    }
+  }
+
+  return candidates;
+}
+
+function getZeroPointCandidateNames(name) {
+  const candidates = [];
+  const add = (candidateName) => {
+    if (candidateName && candidateName !== name && !candidates.some((candidate) => candidate.name === candidateName)) {
+      candidates.push({ name: candidateName, kind: 'zeroPoint' });
+    }
+  };
+
+  add(`${name}_zero`);
+  add(`${name}_zeros`);
+  add(`${name}_zero_point`);
+  add(`${name}.zero`);
+  add(`${name}.zeros`);
+  add(`${name}.zero_point`);
+
+  for (const suffix of ['.weight', '_weight']) {
+    if (name.endsWith(suffix)) {
+      const base = name.slice(0, -suffix.length);
+      add(`${base}${suffix}_zero`);
+      add(`${base}${suffix}_zeros`);
+      add(`${base}${suffix}_zero_point`);
+      add(`${base}${suffix}.zero`);
+      add(`${base}${suffix}.zeros`);
+      add(`${base}${suffix}.zero_point`);
+      add(`${base}.zero`);
+      add(`${base}.zeros`);
+      add(`${base}.zero_point`);
+      add(`${base}_zero`);
+      add(`${base}_zeros`);
+      add(`${base}_zero_point`);
+      add(`${base}.weight_zero`);
+      add(`${base}.weight_zeros`);
+      add(`${base}.weight_zero_point`);
+      add(`${base}_weight_zero`);
+      add(`${base}_weight_zeros`);
+      add(`${base}_weight_zero_point`);
+    }
+  }
+
+  return candidates;
+}
+
+function createAuxiliaryTensorMapping(weightRecord, auxiliaryRecord) {
+  const weightShape = toValidShape(weightRecord.shape);
+  const auxiliaryShape = toValidShape(auxiliaryRecord.shape);
+  const auxiliaryElements = getSafeElementCountNumber(auxiliaryRecord.elementCount);
+  const weightElements = getSafeElementCountNumber(weightRecord.elementCount);
+
+  if (!auxiliaryShape || auxiliaryElements === null || auxiliaryElements <= 0) {
+    return null;
+  }
+
+  if (auxiliaryElements === 1) {
+    return {
+      description: 'scalar',
+      toAuxiliaryOffset: () => 0
+    };
+  }
+
+  if (weightElements !== null && auxiliaryElements === weightElements) {
+    return {
+      description: 'per-element',
+      toAuxiliaryOffset: (linearOffset) => Math.max(0, Math.min(auxiliaryElements - 1, Math.trunc(linearOffset)))
+    };
+  }
+
+  if (weightShape && auxiliaryShape && weightShape.length === auxiliaryShape.length && auxiliaryShape.every((dimension, index) => dimension > 0 && dimension <= weightShape[index])) {
+    const weightStrides = getStrides(weightShape);
+    const auxiliaryStrides = getStrides(auxiliaryShape);
+    const blockSizes = weightShape.map((dimension, index) => Math.max(1, Math.ceil(dimension / auxiliaryShape[index])));
+    return {
+      description: `per-block grid ${formatShape(auxiliaryShape)}, block ${formatShape(blockSizes)}`,
+      toAuxiliaryOffset: (linearOffset) => {
+        const indices = linearOffsetToIndices(weightShape, weightStrides, linearOffset);
+        return indices.reduce((sum, value, index) => {
+          const auxiliaryIndex = Math.min(auxiliaryShape[index] - 1, Math.floor(value / blockSizes[index]));
+          return sum + (auxiliaryIndex * auxiliaryStrides[index]);
+        }, 0);
+      }
+    };
+  }
+
+  if (weightShape && auxiliaryShape && auxiliaryShape.length === 1) {
+    const auxiliaryLength = auxiliaryShape[0];
+    const weightStrides = getStrides(weightShape);
+    if (auxiliaryLength === weightShape[0]) {
+      return {
+        description: 'per first dimension',
+        toAuxiliaryOffset: (linearOffset) => linearOffsetToIndices(weightShape, weightStrides, linearOffset)[0]
+      };
+    }
+    const lastIndex = weightShape.length - 1;
+    if (auxiliaryLength === weightShape[lastIndex]) {
+      return {
+        description: 'per last dimension',
+        toAuxiliaryOffset: (linearOffset) => linearOffsetToIndices(weightShape, weightStrides, linearOffset)[lastIndex]
+      };
+    }
+  }
+
+  if (weightElements !== null && auxiliaryElements < weightElements) {
+    const blockSize = Math.max(1, Math.ceil(weightElements / auxiliaryElements));
+    return {
+      description: `linear blocks of ${blockSize}`,
+      toAuxiliaryOffset: (linearOffset) => Math.max(0, Math.min(auxiliaryElements - 1, Math.floor(Math.trunc(linearOffset) / blockSize)))
+    };
+  }
+
+  return null;
+}
+
+function toValidShape(shape) {
+  if (!Array.isArray(shape)) {
+    return null;
+  }
+  const values = shape.map((dimension) => Number(dimension));
+  return values.every((dimension) => Number.isFinite(dimension) && dimension >= 0) ? values.map((dimension) => Math.trunc(dimension)) : null;
+}
+
+function getSafeElementCountNumber(value) {
+  return value !== null && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : null;
+}
+
+function getStrides(shape) {
+  const strides = new Array(shape.length).fill(1);
+  for (let index = shape.length - 2; index >= 0; index -= 1) {
+    strides[index] = strides[index + 1] * Math.max(1, shape[index + 1]);
+  }
+  return strides;
+}
+
+function linearOffsetToIndices(shape, strides, linearOffset) {
+  const indices = new Array(shape.length).fill(0);
+  let remaining = Math.max(0, Math.trunc(linearOffset));
+  for (let index = 0; index < shape.length; index += 1) {
+    const stride = strides[index];
+    indices[index] = Math.min(Math.max(0, shape[index] - 1), Math.floor(remaining / stride));
+    remaining %= stride;
+  }
+  return indices;
+}
+
+function toFiniteNumber(value) {
+  const number = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function decodeValues(buffer, decoder, requestedElements = Number.MAX_SAFE_INTEGER, startBitOffset = 0) {
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
   const values = [];
-  for (let offset = 0; offset + decoder.bytesPerElement <= buffer.byteLength; offset += decoder.bytesPerElement) {
-    values.push(decoder.read(view, offset));
+
+  if (decoder.bitsPerElement % 8 === 0) {
+    const bytesPerElement = decoder.bitsPerElement / 8;
+    for (let offset = 0; offset + bytesPerElement <= buffer.byteLength && values.length < requestedElements; offset += bytesPerElement) {
+      values.push(decoder.read(view, offset));
+    }
+    return values;
+  }
+
+  for (let index = 0; index < requestedElements; index += 1) {
+    const bitOffset = startBitOffset + (index * decoder.bitsPerElement);
+    if (bitOffset + decoder.bitsPerElement > buffer.byteLength * 8) {
+      break;
+    }
+    values.push(decoder.readBits(readUnsignedBits(buffer, bitOffset, decoder.bitsPerElement)));
   }
   return values;
 }
 
+function readUnsignedBits(buffer, bitOffset, bitLength) {
+  let value = 0;
+  for (let index = 0; index < bitLength; index += 1) {
+    const absoluteBit = bitOffset + index;
+    const byte = buffer[Math.floor(absoluteBit / 8)];
+    const bit = (byte >> (absoluteBit % 8)) & 1;
+    value |= bit << index;
+  }
+  return value;
+}
+
 function getDecoder(dtype) {
+  const normalizedDtype = normalizeDtype(dtype);
   const decoders = {
-    BOOL: { bytesPerElement: 1, read: (view, offset) => view.getUint8(offset) !== 0 },
-    U8: { bytesPerElement: 1, read: (view, offset) => view.getUint8(offset) },
-    I8: { bytesPerElement: 1, read: (view, offset) => view.getInt8(offset) },
-    U16: { bytesPerElement: 2, read: (view, offset) => view.getUint16(offset, true) },
-    I16: { bytesPerElement: 2, read: (view, offset) => view.getInt16(offset, true) },
-    U32: { bytesPerElement: 4, read: (view, offset) => view.getUint32(offset, true) },
-    I32: { bytesPerElement: 4, read: (view, offset) => view.getInt32(offset, true) },
-    U64: { bytesPerElement: 8, read: (view, offset) => view.getBigUint64(offset, true).toString() },
-    I64: { bytesPerElement: 8, read: (view, offset) => view.getBigInt64(offset, true).toString() },
-    F64: { bytesPerElement: 8, read: (view, offset) => view.getFloat64(offset, true) },
-    F32: { bytesPerElement: 4, read: (view, offset) => view.getFloat32(offset, true) },
-    F16: { bytesPerElement: 2, read: (view, offset) => decodeFloat16(view.getUint16(offset, true)) },
-    BF16: { bytesPerElement: 2, read: (view, offset) => decodeBFloat16(view.getUint16(offset, true)) }
+    BOOL: { bitsPerElement: 8, read: (view, offset) => view.getUint8(offset) !== 0 },
+    F4: { bitsPerElement: 4, quantized: true, description: 'MXFP4 decoded from packed 4-bit values.', readBits: decodeFloat4E2M1 },
+    F6_E2M3: { bitsPerElement: 6, quantized: true, description: 'MXFP6 E2M3 decoded from packed 6-bit values.', readBits: (value) => decodePackedFloat(value, 2, 3, 1, false) },
+    F6_E3M2: { bitsPerElement: 6, quantized: true, description: 'MXFP6 E3M2 decoded from packed 6-bit values.', readBits: (value) => decodePackedFloat(value, 3, 2, 3, false) },
+    U8: { bitsPerElement: 8, read: (view, offset) => view.getUint8(offset) },
+    I8: { bitsPerElement: 8, read: (view, offset) => view.getInt8(offset) },
+    F8_E5M2: { bitsPerElement: 8, quantized: true, description: 'FP8 E5M2 decoded to approximate JavaScript numbers.', read: (view, offset) => decodePackedFloat(view.getUint8(offset), 5, 2, 15, true) },
+    F8_E4M3: { bitsPerElement: 8, quantized: true, description: 'FP8 E4M3 decoded to approximate JavaScript numbers.', read: (view, offset) => decodeFloat8E4M3(view.getUint8(offset)) },
+    F8_E8M0: { bitsPerElement: 8, quantized: true, description: 'E8M0 scale values decoded as powers of two.', read: (view, offset) => decodeFloat8E8M0(view.getUint8(offset)) },
+    U16: { bitsPerElement: 16, read: (view, offset) => view.getUint16(offset, true) },
+    I16: { bitsPerElement: 16, read: (view, offset) => view.getInt16(offset, true) },
+    U32: { bitsPerElement: 32, read: (view, offset) => view.getUint32(offset, true) },
+    I32: { bitsPerElement: 32, read: (view, offset) => view.getInt32(offset, true) },
+    U64: { bitsPerElement: 64, read: (view, offset) => view.getBigUint64(offset, true).toString() },
+    I64: { bitsPerElement: 64, read: (view, offset) => view.getBigInt64(offset, true).toString() },
+    F64: { bitsPerElement: 64, read: (view, offset) => view.getFloat64(offset, true) },
+    F32: { bitsPerElement: 32, read: (view, offset) => view.getFloat32(offset, true) },
+    C64: { bitsPerElement: 64, read: (view, offset) => ({ real: view.getFloat32(offset, true), imag: view.getFloat32(offset + 4, true) }) },
+    F16: { bitsPerElement: 16, read: (view, offset) => decodeFloat16(view.getUint16(offset, true)) },
+    BF16: { bitsPerElement: 16, read: (view, offset) => decodeBFloat16(view.getUint16(offset, true)) }
   };
-  return decoders[dtype] || null;
+  return decoders[normalizedDtype] || null;
+}
+
+function normalizeDtype(dtype) {
+  const value = String(dtype || '').toUpperCase();
+  const aliases = {
+    F8_E4M3FN: 'F8_E4M3',
+    F8_E4M3FNUZ: 'F8_E4M3',
+    F8_E5M2FNUZ: 'F8_E5M2',
+    FLOAT8_E4M3FN: 'F8_E4M3',
+    FLOAT8_E5M2: 'F8_E5M2'
+  };
+  return aliases[value] || value;
+}
+
+function isQuantizedDtype(dtype) {
+  const decoder = getDecoder(dtype);
+  return Boolean(decoder && decoder.quantized);
+}
+
+function getDtypeBits(dtype) {
+  const decoder = getDecoder(dtype);
+  return decoder ? decoder.bitsPerElement : null;
+}
+
+function getDtypeDescription(dtype) {
+  const decoder = getDecoder(dtype);
+  return decoder && decoder.description ? decoder.description : '';
+}
+
+function decodeFloat4E2M1(value) {
+  return decodePackedFloat(value, 2, 1, 1, false);
+}
+
+function decodeFloat8E4M3(value) {
+  const sign = (value & 0x80) ? -1 : 1;
+  const exponent = (value >> 3) & 0x0f;
+  const mantissa = value & 0x07;
+
+  if (exponent === 0 && mantissa === 0) {
+    return sign === 1 ? 0 : -0;
+  }
+  if (exponent === 0) {
+    return sign * (mantissa / 8) * Math.pow(2, -6);
+  }
+  if (exponent === 0x0f && mantissa === 0x07) {
+    return NaN;
+  }
+  return sign * (1 + (mantissa / 8)) * Math.pow(2, exponent - 7);
+}
+
+function decodeFloat8E8M0(value) {
+  return value === 0xff ? NaN : Math.pow(2, value - 127);
+}
+
+function decodePackedFloat(value, exponentBits, mantissaBits, bias, hasInfinity) {
+  const signShift = exponentBits + mantissaBits;
+  const sign = (value & (1 << signShift)) ? -1 : 1;
+  const exponentMask = (1 << exponentBits) - 1;
+  const mantissaMask = (1 << mantissaBits) - 1;
+  const exponent = (value >> mantissaBits) & exponentMask;
+  const mantissa = value & mantissaMask;
+
+  if (exponent === 0 && mantissa === 0) {
+    return sign === 1 ? 0 : -0;
+  }
+
+  if (exponent === 0) {
+    return sign * (mantissa / Math.pow(2, mantissaBits)) * Math.pow(2, 1 - bias);
+  }
+
+  if (hasInfinity && exponent === exponentMask) {
+    return mantissa === 0 ? sign * Infinity : NaN;
+  }
+
+  return sign * (1 + (mantissa / Math.pow(2, mantissaBits))) * Math.pow(2, exponent - bias);
 }
 
 function decodeFloat16(value) {
@@ -465,7 +921,15 @@ function sortedRecords(records) {
   return Array.from(records).sort((left, right) => left.name.localeCompare(right.name));
 }
 
-function toTensorSummary(record) {
+function toTensorSummary(record, records = null) {
+  const bitsPerElement = getDtypeBits(record.dtype);
+  const dequantizationPlan = Array.isArray(records) ? buildDequantizationPlan(record, records) : null;
+  const dequantizationSupported = Boolean(dequantizationPlan && dequantizationPlan.supported);
+  const scaleTensorName = dequantizationSupported ? dequantizationPlan.scale.record.name : null;
+  const scaleMapping = dequantizationSupported ? dequantizationPlan.scale.mapping.description : null;
+  const dtypeDescription = dequantizationSupported
+    ? `Dequantized preview will use "${scaleTensorName}" (${scaleMapping}).`
+    : getDtypeDescription(record.dtype);
   return {
     name: record.name,
     dtype: record.dtype,
@@ -473,6 +937,12 @@ function toTensorSummary(record) {
     shapeText: formatShape(record.shape),
     sourceFile: record.sourceFile,
     byteLength: record.byteLength,
+    bitsPerElement,
+    quantized: isQuantizedDtype(record.dtype) || dequantizationSupported,
+    dtypeDescription,
+    dequantizationSupported,
+    dequantizationScaleTensor: scaleTensorName,
+    dequantizationScaleMapping: scaleMapping,
     totalElements: formatElementCount(record.elementCount),
     metadataReady: true,
     previewSupported: Boolean(getDecoder(record.dtype))
@@ -974,9 +1444,26 @@ function getSafetensorsExplorerHtml(webview, fileName) {
       word-break: break-word;
     }
 
-    .preview-meta {
+    .preview-meta,
+    .preview-title {
       margin-bottom: 10px;
       color: var(--vscode-descriptionForeground);
+    }
+
+    .preview-title {
+      margin-top: 12px;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+
+    .preview-title:first-child {
+      margin-top: 0;
+    }
+
+    .preview-note {
+      margin: 0 0 10px;
+      color: var(--vscode-descriptionForeground);
+      line-height: 1.45;
     }
 
     .offset-panel {
@@ -1107,6 +1594,13 @@ function getSafetensorsExplorerHtml(webview, fileName) {
         index += 1;
       }
       return size.toFixed(size >= 10 || index === 0 ? 1 : 2) + ' ' + units[index];
+    }
+
+    function formatDtypeLabel(tensor) {
+      const dtype = tensor && tensor.dtype ? String(tensor.dtype) : '?';
+      const bits = tensor && Number.isFinite(tensor.bitsPerElement) ? String(tensor.bitsPerElement) + '-bit' : '';
+      const suffix = tensor && tensor.quantized ? ' · q' : '';
+      return bits ? dtype + ' · ' + bits + suffix : dtype + suffix;
     }
 
     function escapeHtml(value) {
@@ -1432,7 +1926,7 @@ function getSafetensorsExplorerHtml(webview, fileName) {
         button.appendChild(createTreeRow({
           fullText: node.item.name,
           shapeText: node.item.shapeText || '[]',
-          dtype: node.item.dtype || '?'
+          dtype: formatDtypeLabel(node.item)
         }));
         button.addEventListener('click', () => {
           selectTensor(node.item.name);
@@ -1519,7 +2013,28 @@ function getSafetensorsExplorerHtml(webview, fileName) {
           ' / ' +
           escapeHtml(String(preview.totalElements)) +
           ' values.</div>';
-        return previewMeta + '<pre>' + escapeHtml(JSON.stringify(preview.values, null, 2)) + '</pre>';
+
+        const dequantized = preview.dequantized || null;
+        if (dequantized && dequantized.supported) {
+          const method = [
+            'Method: ' + dequantized.method,
+            dequantized.scaleMapping ? 'scale mapping: ' + dequantized.scaleMapping : ''
+          ].filter(Boolean).join('; ');
+          return [
+            previewMeta,
+            '<div class="preview-title">Dequantized Values</div>',
+            '<div class="preview-note">' + escapeHtml(method) + '</div>',
+            '<pre>' + escapeHtml(JSON.stringify(dequantized.values, null, 2)) + '</pre>',
+            '<div class="preview-title">Stored Values</div>',
+            '<pre>' + escapeHtml(JSON.stringify(preview.values, null, 2)) + '</pre>'
+          ].join('');
+        }
+
+        const dequantizedNote = dequantized && !dequantized.supported
+          ? '<div class="preview-note">Dequantized preview unavailable: ' + escapeHtml(dequantized.reason) + '</div>'
+          : '';
+        const storedTitle = tensor.quantized || dequantizedNote ? '<div class="preview-title">Stored Values</div>' : '';
+        return previewMeta + dequantizedNote + storedTitle + '<pre>' + escapeHtml(JSON.stringify(preview.values, null, 2)) + '</pre>';
       })();
 
       const canLoadValues = tensor.previewSupported;
@@ -1553,7 +2068,9 @@ function getSafetensorsExplorerHtml(webview, fileName) {
       detailRoot.innerHTML = [
         '<div class="tensor-name">' + escapeHtml(tensor.name) + '</div>',
         '<dl class="detail-grid">',
-        '<dt>DType</dt><dd>' + escapeHtml(tensor.dtype || '?') + '</dd>',
+        '<dt>DType</dt><dd>' + escapeHtml(formatDtypeLabel(tensor)) + '</dd>',
+        tensor.quantized ? '<dt>Quantized</dt><dd>' + escapeHtml(tensor.dtypeDescription || 'Quantized dtype preview is supported.') + '</dd>' : '',
+        tensor.dequantizationSupported ? '<dt>Dequantization</dt><dd>' + escapeHtml('Automatic on Load Tensor Values using ' + tensor.dequantizationScaleTensor + ' (' + tensor.dequantizationScaleMapping + ').') + '</dd>' : '',
         '<dt>Shape</dt><dd>' + escapeHtml(tensor.shapeText || '[]') + '</dd>',
         '<dt>Elements</dt><dd>' + escapeHtml(tensor.totalElements || '?') + '</dd>',
         '<dt>Bytes</dt><dd>' + escapeHtml(formatBytes(tensor.byteLength)) + '</dd>',
@@ -1666,6 +2183,10 @@ function getSafetensorsExplorerHtml(webview, fileName) {
         reason: current ? current.reason : null,
         dtype: current ? current.dtype : null,
         values: append && current && Array.isArray(current.values) ? current.values.slice() : [],
+        dequantized: append && current && current.dequantized ? {
+          ...current.dequantized,
+          values: Array.isArray(current.dequantized.values) ? current.dequantized.values.slice() : []
+        } : (current ? current.dequantized : null),
         totalElements: current ? current.totalElements : '?',
         startOffset,
         nextOffset,
@@ -1707,10 +2228,25 @@ function getSafetensorsExplorerHtml(webview, fileName) {
             });
           } else {
             const existingValues = current && current.supported && Array.isArray(current.values) && current.appendPending ? current.values : [];
+            const existingDequantizedValues = current &&
+              current.supported &&
+              current.appendPending &&
+              current.dequantized &&
+              current.dequantized.supported &&
+              Array.isArray(current.dequantized.values)
+                ? current.dequantized.values
+                : [];
+            const nextDequantized = incoming.dequantized && incoming.dequantized.supported
+              ? {
+                ...incoming.dequantized,
+                values: existingDequantizedValues.concat(incoming.dequantized.values)
+              }
+              : incoming.dequantized;
             state.previews.set(message.payload.name, {
               supported: true,
               dtype: incoming.dtype,
               values: existingValues.concat(incoming.values),
+              dequantized: nextDequantized,
               totalElements: incoming.totalElements,
               startOffset: current && Number.isFinite(current.startOffset) ? current.startOffset : incoming.offset,
               nextOffset: incoming.nextOffset,
@@ -1765,6 +2301,8 @@ module.exports = {
   _internal: {
     readSafetensorsHeader,
     readTensorPreview,
+    buildDequantizationPlan,
+    applyDequantizationPreview,
     decodeFloat16,
     decodeBFloat16,
     getDecoder

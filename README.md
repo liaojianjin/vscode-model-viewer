@@ -28,6 +28,8 @@ It works both locally and with Remote SSH.
   可查看 tensor 的 shape、dtype、分片、元素数量和字节大小等元信息。
 - Preview tensor values with manual offsets and paged loading.  
   支持手动 offset 和分页加载的 tensor 值预览。
+- Preview quantized safetensors dtypes including FP8 and packed MXFP4/MXFP6 values.  
+  支持预览 FP8 以及打包 MXFP4/MXFP6 等量化 safetensors dtype。
 
 ## Requirements / 依赖要求
 
@@ -107,11 +109,22 @@ The Safetensors Explorer provides:
   tensor 元信息面板
 - Offset-based value preview  
   基于 offset 的值预览
+- Quantized dtype preview for `F8_E5M2`, `F8_E4M3`, `F8_E8M0`, `F4`, `F6_E2M3`, and `F6_E3M2`, with automatic dequantized preview when related scale / zero-point tensors can be matched.  
+  支持 `F8_E5M2`、`F8_E4M3`、`F8_E8M0`、`F4`、`F6_E2M3`、`F6_E3M2` 等量化 dtype 预览；当能匹配到关联的 scale / zero-point tensor 时，会自动显示反量化预览。
 - `Load Tensor Values` and `Load More` pagination  
   `Load Tensor Values` 与 `Load More` 分页加载
 
 Tensor values are loaded only when requested from the detail pane.  
 只有在详情面板里主动请求时，才会读取 tensor 值。
+
+For quantized tensors, the preview always shows the stored values. If a related scale tensor such as `weight_scale`, `weight_scale_inv`, `weight.scale`, or `weight.scales` can be mapped to the selected weight, Safetensors Explorer also shows a dequantized preview. Matching zero-point tensors such as `weight_zero_point` are applied when present.  
+对于量化 tensor，预览始终会显示存储值。如果能把 `weight_scale`、`weight_scale_inv`、`weight.scale`、`weight.scales` 等关联 scale tensor 映射到当前权重，Safetensors Explorer 还会显示反量化预览；如果存在 `weight_zero_point` 等 zero-point tensor，也会一起应用。
+
+Sibling block-scale tensors are supported. For example, `mtp.0.attn.wo_a.weight` with shape `[16384, 4096]` and `mtp.0.attn.wo_a.scale` with shape `[128, 32]` is treated as a `[128, 32]` scale grid over `[128, 128]` weight blocks.  
+支持同前缀的 block-scale tensor。例如 `mtp.0.attn.wo_a.weight` 的 shape 是 `[16384, 4096]`，`mtp.0.attn.wo_a.scale` 的 shape 是 `[128, 32]` 时，会按 `[128, 32]` 的 scale 网格映射到 `[128, 128]` 的权重 block。
+
+For `I8` weights with `F8_E8M0` block scales, select the `*.weight` tensor and click `Load Tensor Values`. Selecting the `*.scale` tensor shows the scale tensor's stored values instead.  
+对于 `I8` 权重配 `F8_E8M0` block scale 的情况，需要选中 `*.weight` tensor 并点击 `Load Tensor Values`；如果选中的是 `*.scale` tensor，则显示的是 scale tensor 自己的存储值。
 
 ## Remote SSH Behavior / Remote SSH 行为
 
@@ -200,8 +213,8 @@ To launch an Extension Development Host:
   `Safetensors Explorer` 目前侧重元信息浏览和分页预览，不是完整 tensor 导出工具。
 - Large safetensors files or large sharded indexes may still take noticeable time to open.  
   较大的 safetensors 文件或大型分片索引在打开时仍可能有明显延迟。
-- Tensor preview currently targets common dtypes such as `BOOL`, integer types, `F16`, `BF16`, `F32`, and `F64`.  
-  当前 tensor 预览主要支持常见 dtype，例如 `BOOL`、整数类型、`F16`、`BF16`、`F32` 和 `F64`。
+- Dequantized preview is intentionally conservative. It applies directly stored quantized values with related scale / zero-point tensors, but it does not unpack format-specific `qweight` layouts such as GPTQ/AWQ without an explicit, reliable recipe in the safetensors file.  
+  反量化预览会保持保守：它会对直接存储的量化值应用关联的 scale / zero-point tensor，但不会在 safetensors 文件缺少可靠规则时强行解包 GPTQ/AWQ 等格式专用的 `qweight` 布局。
 
 ## Related Projects / 相关项目
 
