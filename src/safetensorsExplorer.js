@@ -1110,9 +1110,13 @@ function getSafetensorsExplorerHtml(webview, fileName) {
       min-height: 0;
       display: grid;
       grid-template-columns: 1fr;
-      grid-template-rows: minmax(0, 3fr) minmax(0, 2fr);
-      gap: 1px;
+      grid-template-rows: minmax(120px, 3fr) 8px minmax(160px, 2fr);
       background: var(--vscode-panel-border);
+    }
+
+    .layout.resizing {
+      user-select: none;
+      cursor: row-resize;
     }
 
     .pane {
@@ -1120,6 +1124,40 @@ function getSafetensorsExplorerHtml(webview, fileName) {
       min-height: 0;
       overflow: hidden;
       background: var(--vscode-editor-background);
+    }
+
+    .pane-resizer {
+      width: 100%;
+      min-height: 8px;
+      padding: 0;
+      border: 0;
+      background: var(--vscode-panel-border);
+      cursor: row-resize;
+      position: relative;
+    }
+
+    .pane-resizer::before {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 44px;
+      height: 2px;
+      border-radius: 999px;
+      transform: translate(-50%, -50%);
+      background: var(--vscode-descriptionForeground);
+      opacity: 0.65;
+    }
+
+    .pane-resizer:hover::before,
+    .pane-resizer:focus-visible::before {
+      opacity: 1;
+      background: var(--vscode-focusBorder);
+    }
+
+    .pane-resizer:focus-visible {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
     }
 
     .pane-scroll {
@@ -1444,6 +1482,44 @@ function getSafetensorsExplorerHtml(webview, fileName) {
       word-break: break-word;
     }
 
+    .value-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: stretch;
+      margin: 0;
+      padding: 10px;
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 8px;
+      background: rgba(18, 20, 24, 0.7);
+      overflow: auto;
+      min-height: 42px;
+      max-height: 180px;
+    }
+
+    .value-chip {
+      flex: 0 0 auto;
+      min-width: 42px;
+      max-width: 220px;
+      padding: 6px 9px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.035);
+      color: var(--vscode-editor-foreground);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-align: right;
+    }
+
+    .value-empty {
+      color: var(--vscode-descriptionForeground);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
     .preview-meta,
     .preview-title {
       margin-bottom: 10px;
@@ -1511,7 +1587,7 @@ function getSafetensorsExplorerHtml(webview, fileName) {
 
     @media (max-width: 900px) {
       .layout {
-        grid-template-rows: minmax(0, 1fr) minmax(220px, auto);
+        grid-template-rows: minmax(120px, 1fr) 8px minmax(220px, auto);
       }
     }
   </style>
@@ -1546,6 +1622,7 @@ function getSafetensorsExplorerHtml(webview, fileName) {
         </div>
       </div>
     </section>
+    <button id="pane-resizer" class="pane-resizer" type="button" aria-label="Resize panes" title="Drag to resize panes"></button>
     <section class="pane">
       <div class="pane-scroll">
         <div id="detail-root" class="detail-empty">Select a tensor from the left tree. Values are loaded on demand from the remote host only when you ask for them.</div>
@@ -1565,7 +1642,8 @@ function getSafetensorsExplorerHtml(webview, fileName) {
       offsets: new Map(),
       filterText: '',
       prefixOnly: false,
-      openGroups: new Set()
+      openGroups: new Set(),
+      paneSplitRatio: 0.6
     };
 
     const title = document.getElementById('title');
@@ -1573,11 +1651,85 @@ function getSafetensorsExplorerHtml(webview, fileName) {
     const tensorCount = document.getElementById('tensor-count');
     const shardCount = document.getElementById('shard-count');
     const metadataRoot = document.getElementById('metadata-root');
+    const layoutRoot = document.querySelector('.layout');
+    const paneResizer = document.getElementById('pane-resizer');
     const searchInput = document.getElementById('search-input');
     const prefixToggle = document.getElementById('prefix-toggle');
     const treeRoot = document.getElementById('tree-root');
     const detailRoot = document.getElementById('detail-root');
     const errorRoot = document.getElementById('error-root');
+
+    function clampNumber(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function applyPaneSplit(ratio) {
+      if (!layoutRoot) {
+        return;
+      }
+      const resizerHeight = paneResizer ? paneResizer.offsetHeight : 8;
+      const available = Math.max(1, layoutRoot.clientHeight - resizerHeight);
+      const minTop = Math.min(180, Math.max(96, available * 0.25));
+      const minBottom = Math.min(220, Math.max(120, available * 0.25));
+      const top = clampNumber(Math.round(available * ratio), minTop, Math.max(minTop, available - minBottom));
+      const bottom = Math.max(minBottom, available - top);
+      state.paneSplitRatio = top / available;
+      layoutRoot.style.gridTemplateRows = top + 'px ' + resizerHeight + 'px ' + bottom + 'px';
+    }
+
+    function setPaneSplitFromClientY(clientY) {
+      if (!layoutRoot) {
+        return;
+      }
+      const rect = layoutRoot.getBoundingClientRect();
+      const resizerHeight = paneResizer ? paneResizer.offsetHeight : 8;
+      const available = Math.max(1, rect.height - resizerHeight);
+      applyPaneSplit((clientY - rect.top) / available);
+    }
+
+    function setupPaneResizer() {
+      if (!layoutRoot || !paneResizer) {
+        return;
+      }
+
+      paneResizer.addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        paneResizer.setPointerCapture(event.pointerId);
+        layoutRoot.classList.add('resizing');
+        setPaneSplitFromClientY(event.clientY);
+      });
+
+      paneResizer.addEventListener('pointermove', (event) => {
+        if (!paneResizer.hasPointerCapture(event.pointerId)) {
+          return;
+        }
+        setPaneSplitFromClientY(event.clientY);
+      });
+
+      const stopResize = (event) => {
+        if (paneResizer.hasPointerCapture(event.pointerId)) {
+          paneResizer.releasePointerCapture(event.pointerId);
+        }
+        layoutRoot.classList.remove('resizing');
+      };
+      paneResizer.addEventListener('pointerup', stopResize);
+      paneResizer.addEventListener('pointercancel', stopResize);
+
+      paneResizer.addEventListener('keydown', (event) => {
+        if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') {
+          return;
+        }
+        event.preventDefault();
+        const delta = event.key === 'ArrowUp' ? -0.04 : 0.04;
+        applyPaneSplit(state.paneSplitRatio + delta);
+      });
+
+      window.addEventListener('resize', () => {
+        applyPaneSplit(state.paneSplitRatio);
+      });
+
+      applyPaneSplit(state.paneSplitRatio);
+    }
 
     function formatBytes(value) {
       if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -1601,6 +1753,46 @@ function getSafetensorsExplorerHtml(webview, fileName) {
       const bits = tensor && Number.isFinite(tensor.bitsPerElement) ? String(tensor.bitsPerElement) + '-bit' : '';
       const suffix = tensor && tensor.quantized ? ' · q' : '';
       return bits ? dtype + ' · ' + bits + suffix : dtype + suffix;
+    }
+
+    function formatPreviewValue(value) {
+      if (typeof value === 'number') {
+        if (Number.isNaN(value)) {
+          return 'NaN';
+        }
+        if (!Number.isFinite(value)) {
+          return String(value);
+        }
+        return Number.isInteger(value) ? String(value) : String(Number(value.toPrecision(8)));
+      }
+      if (typeof value === 'boolean') {
+        return value ? 'true' : 'false';
+      }
+      if (value === null || value === undefined) {
+        return 'null';
+      }
+      if (typeof value === 'object') {
+        return JSON.stringify(value);
+      }
+      return String(value);
+    }
+
+    function renderValueStrip(titleText, values, noteText = '') {
+      const items = Array.isArray(values) ? values : [];
+      const chips = items.length === 0
+        ? '<span class="value-empty">[]</span>'
+        : items.map((value, index) => {
+          const text = formatPreviewValue(value);
+          return '<span class="value-chip" title="#' + String(index) + ' ' + escapeHtml(text) + '">' + escapeHtml(text) + '</span>';
+        }).join('');
+      const note = noteText ? '<div class="preview-note">' + escapeHtml(noteText) + '</div>' : '';
+      return [
+        '<div class="preview-title">' + escapeHtml(titleText) + '</div>',
+        note,
+        '<div class="value-strip" role="list">',
+        chips,
+        '</div>'
+      ].join('');
     }
 
     function escapeHtml(value) {
@@ -2022,19 +2214,15 @@ function getSafetensorsExplorerHtml(webview, fileName) {
           ].filter(Boolean).join('; ');
           return [
             previewMeta,
-            '<div class="preview-title">Dequantized Values</div>',
-            '<div class="preview-note">' + escapeHtml(method) + '</div>',
-            '<pre>' + escapeHtml(JSON.stringify(dequantized.values, null, 2)) + '</pre>',
-            '<div class="preview-title">Stored Values</div>',
-            '<pre>' + escapeHtml(JSON.stringify(preview.values, null, 2)) + '</pre>'
+            renderValueStrip('Dequantized Values', dequantized.values, method),
+            renderValueStrip('Stored Values', preview.values)
           ].join('');
         }
 
         const dequantizedNote = dequantized && !dequantized.supported
           ? '<div class="preview-note">Dequantized preview unavailable: ' + escapeHtml(dequantized.reason) + '</div>'
           : '';
-        const storedTitle = tensor.quantized || dequantizedNote ? '<div class="preview-title">Stored Values</div>' : '';
-        return previewMeta + dequantizedNote + storedTitle + '<pre>' + escapeHtml(JSON.stringify(preview.values, null, 2)) + '</pre>';
+        return previewMeta + dequantizedNote + renderValueStrip(tensor.quantized || dequantizedNote ? 'Stored Values' : 'Values', preview.values);
       })();
 
       const canLoadValues = tensor.previewSupported;
@@ -2277,6 +2465,7 @@ function getSafetensorsExplorerHtml(webview, fileName) {
       renderTree();
     });
 
+    setupPaneResizer();
     vscode.postMessage({ type: 'ready' });
   </script>
 </body>
